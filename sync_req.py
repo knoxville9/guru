@@ -145,6 +145,18 @@ def read_stock_codes(file_path: str) -> list:
     logger.info(f"从文件 {file_path} 读取到 {len(stock_codes)} 个股票代码")
     return stock_codes
 
+def save_rank_above_90_codes(codes, folder_path):
+    """保存rank大于90的股票代码到TXT文件"""
+    if not codes:
+        logger.info("没有rank大于90的股票代码需要保存")
+        return
+        
+    file_path = os.path.join(folder_path, "rank_above_90.txt")
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for code in codes:
+            f.write(f"{code}\n")
+    logger.info(f"已生成rank>90的股票代码文件: {file_path} (共{len(codes)}个)")
+
 async def batch_request_save_filtered(
     authorization: str, 
     cookie: str, 
@@ -160,6 +172,9 @@ async def batch_request_save_filtered(
     if not stock_codes:
         logger.warning("没有有效的股票代码可处理，程序退出")
         return
+    
+    # 用于保存rank>90的股票代码
+    rank_above_90_codes = []
     
     # 构建任务列表
     tasks = []
@@ -218,22 +233,30 @@ async def batch_request_save_filtered(
                         logger.info(f"股票代码: {stock_code} ({market_prefix}), rank={rank} < 90，不保存 (请求次数: {request_counter[stock_code]})")
                         continue
                     
+                    # 如果rank>90，添加到列表中
+                    if rank is not None and rank >= 90:
+                        rank_above_90_codes.append(stock_code)
+                    
                     # 保存数据到日期文件夹
                     filename = f"{stock_code}_{market_prefix.replace(':', '')}.json"
                     file_path = os.path.join(today_folder, filename)
                     
                     with open(file_path, 'w', encoding='utf-8') as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
-                    logger.info(f"已保存: {file_path}, 响应长度: {len(json.dumps(data))} (请求次数: {request_counter[stock_code]})")
+                    logger.info(f"已保存: {file_path}, 响应长度: {len(json.dumps(data))}, rank={rank} (请求次数: {request_counter[stock_code]})")
                 else:
                     logger.warning(f"股票代码: {stock_code} ({market_prefix}), 处理失败，状态码: {status_code} (请求次数: {request_counter[stock_code]})")
             except Exception as e:
                 logger.error(f"处理股票代码: {stock_code} ({market_prefix}) 时发生错误: {str(e)} (请求次数: {request_counter[stock_code]})", exc_info=True)
     
+    # 保存rank>90的股票代码到TXT
+    save_rank_above_90_codes(rank_above_90_codes, today_folder)
+    
     # 打印总体统计信息
     logger.info("\n===== 任务统计 =====")
     logger.info(f"总任务数: {total_tasks}")
     logger.info(f"完成任务数: {completed_tasks}")
+    logger.info(f"rank>90的股票数: {len(rank_above_90_codes)}")
     logger.info(f"数据保存目录: {os.path.abspath(today_folder)}")
     logger.info(f"平均请求次数: {sum(request_counter.values())/len(request_counter):.2f}")
     
@@ -253,7 +276,8 @@ def main():
     authorization = ""
     cookie = ""
     signature = ""
- 
+
+    
     try:
         asyncio.run(batch_request_save_filtered(
             authorization, 
