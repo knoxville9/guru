@@ -1,162 +1,268 @@
 import asyncio
 import aiohttp
-import aiofiles
 import json
-import ssl
-import time
+import logging
+from typing import Tuple, Dict, Any
+from collections import defaultdict
+import sys
 import os
-from typing import Tuple, Optional
+from datetime import datetime
 
-# Configurable parameters
-CONCURRENCY = 100               # Number of concurrent requests (adjust according to machine and target server capacity)
-RETRIES = 3                     # Number of retries per request
-BACKOFF_FACTOR = 0.5            # Exponential backoff base factor
-REQUEST_TIMEOUT = 15            # Single request timeout in seconds
-OUTPUT_FILE = "output.jsonl"    # Save results to a single JSONL file to avoid many small files
-SAVE_SEPARATE_FILES = False     # If True, create a separate file for each stock_code (preserve original behavior)
-VERIFY_SSL = True               # Whether to verify SSL certificates; recommended True in production
-LIMIT_PER_HOST = 0              # aiohttp.TCPConnector limit_per_host (0 means no per-host limit)
-START = 603001
-END = 605599 + 1                # range upper bound +1
+# 全局配置
+MAX_WORKERS = 10  # 全局并发数控制
+TIMEOUT = 10  # 请求超时时间(秒)
 
-# Headers template (you can supply authorization/signature/cookie to replace or extend these)
-COMMON_HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "accept-language": "zh-CN,zh;q=0.9",
-    "priority": "u=1, i",
-    "referer": "https://www.gurufocus.com/stocks/region/asia/china",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# Helper: parse cookie string -> dict
-def parse_cookie_str(cookie_str: str) -> dict:
-    return dict([c.strip().split('=', 1) for c in cookie_str.split(';') if '=' in c])
+# 全局请求计数器
+request_counter = defaultdict(int)
 
-# Build SSL context. Return None to use aiohttp default verification.
-def make_ssl_context(verify: bool) -> Optional[ssl.SSLContext]:
-    if verify:
-        return None  # aiohttp default will perform verification
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+def get_today_folder():
+    """获取当天日期的文件夹名称，格式为YYYY-MM-DD"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    folder_name = f"stock_data_{today}"
+    
+    # 创建文件夹（如果不存在）
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+        logger.info(f"创建日期文件夹: {folder_name}")
+    else:
+        logger.info(f"使用已存在的日期文件夹: {folder_name}")
+    
+    return folder_name
 
-# Single fetch with retry and exponential backoff
-async def fetch_one(session: aiohttp.ClientSession, stock_code: str, market_prefix: str,
-                    headers: dict, cookies: dict, sem: asyncio.Semaphore) -> Tuple[str, Optional[dict], Optional[str]]:
+async def query_gurufocus_history(
+    session: aiohttp.ClientSession,
+    stock_code: str, 
+    market_prefix: str, 
+    authorization: str, 
+    cookie: str, 
+    signature: str
+) -> Tuple[str, Dict[str, Any], int, str]:
+    """异步查询股票历史数据，带请求次数统计"""
+    # 增加请求计数器
+    request_counter[stock_code] += 1
+    current_attempt = request_counter[stock_code]
+    
     url = f"https://www.gurufocus.com/reader/_api/gf_rank/{market_prefix}{stock_code}?v=1.7.44"
-    attempt = 0
-    async with sem:
-        while attempt <= RETRIES:
-            try:
-                timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-                async with session.get(url, headers=headers, cookies=cookies, timeout=timeout) as resp:
-                    status = resp.status
-                    text = await resp.text()
-                    if status == 200:
-                        # Try to parse JSON
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            data = None
-                        return stock_code, data, text
-                    # Retry on common transient statuses with backoff
-                    if status in (429, 500, 502, 503, 504):
-                        wait = BACKOFF_FACTOR * (2 ** attempt)
-                        attempt += 1
-                        await asyncio.sleep(wait)
-                        continue
-                    # Other statuses: return with error message
-                    return stock_code, None, f"status {status}"
-            except asyncio.TimeoutError:
-                attempt += 1
-                await asyncio.sleep(BACKOFF_FACTOR * (2 ** attempt))
-            except Exception as e:
-                attempt += 1
-                await asyncio.sleep(BACKOFF_FACTOR * (2 ** attempt))
-        return stock_code, None, "failed after retries"
-
-# Batch runner: process tasks and write outputs
-async def run_batch(authorization: str, cookie: str, signature: str):
-    # Prepare headers & cookies
-    headers = COMMON_HEADERS.copy()
-    if authorization:
-        headers["authorization"] = authorization
-    if signature:
-        headers["signature"] = signature
-    cookies = parse_cookie_str(cookie) if cookie else {}
-
-    ssl_ctx = make_ssl_context(VERIFY_SSL)
-
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=LIMIT_PER_HOST, ssl=ssl_ctx)
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    # Ensure output folder exists if saving separate files
-    if SAVE_SEPARATE_FILES and not os.path.isdir("out"):
-        os.makedirs("out", exist_ok=True)
-
-    total = END - START
-    success_count = 0
-    skipped_count = 0
-    failed_count = 0
-    processed = 0
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = []
-        for i in range(START, END):
-            stock_code = str(i).zfill(6)
-            # The original script used ('SHSE:', stock_code) as market_prefix; extend here if you have more markets
-            tasks.append(fetch_one(session, stock_code, "SHSE:", headers, cookies, sem))
-
-        # Process results as they arrive
-        for coro in asyncio.as_completed(tasks):
-            stock_code, data, text_or_err = await coro
-            processed += 1
-
-            if data:
-                rank = data.get("rank", None)
-                # Original script logic: if rank is not None and rank < 90: skip saving
-                if rank is not None and rank < 90:
-                    print(f"[{processed}/{total}] {stock_code} rank={rank} -> skipped")
-                    skipped_count += 1
-                    continue
-                # Save data
-                if SAVE_SEPARATE_FILES:
-                    fname = os.path.join("out", f"{stock_code}.json")
-                    try:
-                        async with aiofiles.open(fname, "w", encoding="utf-8") as f:
-                            await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-                        print(f"[{processed}/{total}] Saved file {fname}")
-                    except Exception as e:
-                        print(f"[{processed}/{total}] Write error for {stock_code}: {e}")
-                        failed_count += 1
-                else:
-                    # Append JSON line to output file
-                    try:
-                        async with aiofiles.open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-                            await f.write(json.dumps({"code": stock_code, "data": data}, ensure_ascii=False) + "\n")
-                        success_count += 1
-                        print(f"[{processed}/{total}] Appended {stock_code}  len={len(text_or_err) if isinstance(text_or_err, str) else 'N/A'}")
-                    except Exception as e:
-                        print(f"[{processed}/{total}] Append error for {stock_code}: {e}")
-                        failed_count += 1
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "authorization": authorization,
+        "priority": "u=1, i",
+        "referer": "https://www.gurufocus.com/stocks/region/asia/china",
+        "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+        "sec-ch-ua-arch": '""',
+        "sec-ch-ua-bitness": '""',
+        "sec-ch-ua-full-version": '""',
+        "sec-ch-ua-full-version-list": "",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform-version": '""',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "signature": signature,
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    }
+    
+    # 解析cookies
+    cookies = {}
+    try:
+        cookies = dict([c.strip().split('=', 1) for c in cookie.split(';') if '=' in c])
+    except Exception as e:
+        logger.error(f"解析Cookie失败: {str(e)}, Cookie内容: {cookie}")
+    
+    try:
+        async with session.get(
+            url, 
+            headers=headers, 
+            cookies=cookies,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+        ) as response:
+            status_code = response.status
+            logger.debug(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), 响应状态码: {status_code}")
+            
+            if status_code == 200:
+                try:
+                    data = await response.json()
+                    return stock_code, data, status_code, market_prefix
+                except json.JSONDecodeError as e:
+                    logger.error(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), 解析JSON失败: {str(e)}")
+                    text = await response.text()
+                    logger.debug(f"响应内容: {text[:500]}")
+                    return stock_code, {"error": "JSON解析失败", "content": text[:500]}, status_code, market_prefix
             else:
-                failed_count += 1
-                print(f"[{processed}/{total}] Failed {stock_code}: {text_or_err}")
+                text = await response.text()
+                logger.warning(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), 非200状态码: {status_code}, 响应内容: {text[:500]}")
+                return stock_code, {"error": "非200状态码", "status_code": status_code, "content": text[:500]}, status_code, market_prefix
+                
+    except asyncio.TimeoutError:
+        logger.error(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), 请求超时({TIMEOUT}秒)")
+        return stock_code, {"error": "请求超时"}, 408, market_prefix
+    except aiohttp.ClientError as e:
+        logger.error(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), HTTP请求错误: {str(e)}")
+        return stock_code, {"error": "HTTP请求错误", "details": str(e)}, 500, market_prefix
+    except Exception as e:
+        logger.error(f"股票代码: {stock_code} ({market_prefix}) (第{current_attempt}次尝试), 发生未知错误: {str(e)}", exc_info=True)
+        return stock_code, {"error": "未知错误", "details": str(e)}, 500, market_prefix
 
-    print("Done. processed:", processed, "saved:", success_count, "skipped:", skipped_count, "failed:", failed_count)
+def get_market_prefix(stock_code: str) -> str:
+    """根据股票代码开头判断市场前缀"""
+    if not stock_code:
+        return ""
+        
+    first_char = stock_code[0]
+    if first_char == '6':
+        return 'SHSE:'
+    elif first_char in ('0', '3'):
+        return 'SZSE:'
+    else:
+        logger.warning(f"未知的股票代码格式: {stock_code}，默认使用SHSE:")
+        return 'SHSE:'
 
-# Entrypoint helper
+def read_stock_codes(file_path: str) -> list:
+    """从文件读取股票代码并去重"""
+    if not os.path.exists(file_path):
+        logger.error(f"文件不存在: {file_path}")
+        raise FileNotFoundError(f"股票代码文件 {file_path} 不存在")
+    
+    stock_codes = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            code = line.strip()
+            if code and code not in stock_codes:  # 去重
+                stock_codes.append(code)
+    
+    logger.info(f"从文件 {file_path} 读取到 {len(stock_codes)} 个股票代码")
+    return stock_codes
+
+async def batch_request_save_filtered(
+    authorization: str, 
+    cookie: str, 
+    signature: str,
+    code_file_path: str
+):
+    """从文件读取股票代码，批量异步请求并保存过滤后的数据，带进度提示"""
+    # 获取当天日期文件夹
+    today_folder = get_today_folder()
+    
+    # 从文件读取股票代码
+    stock_codes = read_stock_codes(code_file_path)
+    if not stock_codes:
+        logger.warning("没有有效的股票代码可处理，程序退出")
+        return
+    
+    # 构建任务列表
+    tasks = []
+    for code in stock_codes:
+        # 自动判断市场前缀
+        market_prefix = get_market_prefix(code)
+        tasks.append((market_prefix, code))
+    
+    # 计算总任务数
+    total_tasks = len(tasks)
+    completed_tasks = 0
+    
+    logger.info(f"开始处理任务，共 {total_tasks} 个股票代码，并发数: {MAX_WORKERS}")
+    
+    # 限制并发数
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    
+    async def bounded_task(market_prefix, stock_code):
+        nonlocal completed_tasks
+        try:
+            result = await query_gurufocus_history(
+                session, 
+                stock_code, 
+                market_prefix, 
+                authorization, 
+                cookie, 
+                signature
+            )
+            return result
+        finally:
+            # 完成一个任务就更新进度
+            completed_tasks += 1
+            progress = (completed_tasks / total_tasks) * 100
+            # 打印进度（覆盖当前行）
+            sys.stdout.write(f"\r处理进度: {completed_tasks}/{total_tasks} ({progress:.2f}%) | 当前股票: {stock_code} ({market_prefix})")
+            sys.stdout.flush()
+    
+    # 创建异步会话
+    async with aiohttp.ClientSession() as session:
+        # 创建所有任务
+        all_tasks = [bounded_task(market_prefix, stock_code) for market_prefix, stock_code in tasks]
+        
+        # 等待所有任务完成
+        results = await asyncio.gather(*all_tasks)
+        
+        # 换行，避免进度条被覆盖
+        print()
+        
+        # 处理结果
+        for stock_code, data, status_code, market_prefix in results:
+            try:
+                if status_code == 200:
+                    rank = data.get('rank', None)
+                    # 根据rank过滤
+                    if rank is not None and rank < 90:
+                        logger.info(f"股票代码: {stock_code} ({market_prefix}), rank={rank} < 90，不保存 (请求次数: {request_counter[stock_code]})")
+                        continue
+                    
+                    # 保存数据到日期文件夹
+                    filename = f"{stock_code}_{market_prefix.replace(':', '')}.json"
+                    file_path = os.path.join(today_folder, filename)
+                    
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    logger.info(f"已保存: {file_path}, 响应长度: {len(json.dumps(data))} (请求次数: {request_counter[stock_code]})")
+                else:
+                    logger.warning(f"股票代码: {stock_code} ({market_prefix}), 处理失败，状态码: {status_code} (请求次数: {request_counter[stock_code]})")
+            except Exception as e:
+                logger.error(f"处理股票代码: {stock_code} ({market_prefix}) 时发生错误: {str(e)} (请求次数: {request_counter[stock_code]})", exc_info=True)
+    
+    # 打印总体统计信息
+    logger.info("\n===== 任务统计 =====")
+    logger.info(f"总任务数: {total_tasks}")
+    logger.info(f"完成任务数: {completed_tasks}")
+    logger.info(f"数据保存目录: {os.path.abspath(today_folder)}")
+    logger.info(f"平均请求次数: {sum(request_counter.values())/len(request_counter):.2f}")
+    
+    # 按市场统计
+    sh_count = sum(1 for code in stock_codes if code.startswith('6'))
+    sz_count = len(stock_codes) - sh_count
+    logger.info(f"沪市(SHSE)股票数: {sh_count}")
+    logger.info(f"深市(SZSE)股票数: {sz_count}")
+    logger.info("====================")
+
 def main():
-    authorization = ""  # Fill in your authorization token if needed
-    cookie = ""         # Fill in your cookie string if needed
-    signature = ""      # Fill in your signature if needed
-    start_time = time.time()
-    asyncio.run(run_batch(authorization, cookie, signature))
-    print("Elapsed:", time.time() - start_time)
+    # 在main函数中直接设置参数，使用时只需修改这里的值
+    # 股票代码文件路径
+    code_file_path = "code.txt"
+    
+    # 以下参数需要替换为实际的值
+    authorization = ""
+    cookie = ""
+    signature = ""
+ 
+    try:
+        asyncio.run(batch_request_save_filtered(
+            authorization, 
+            cookie, 
+            signature,
+            code_file_path
+        ))
+    except Exception as e:
+        logger.critical(f"程序运行出错: {str(e)}", exc_info=True)
 
 if __name__ == "__main__":
     main()
